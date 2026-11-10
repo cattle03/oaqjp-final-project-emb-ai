@@ -1,1 +1,1285 @@
 
+# -*- coding: utf-8 -*-
+"""
+用 Transformer 预测通信板块个股未来收益。
+
+流程：
+  量价/估值因子 -> 因子质量诊断+筛选（evaluate_alpha / pass_quality_gate，训练期）
+  -> 按股票构造时间序列窗口 -> Transformer 回归预测未来收益
+  -> 横截面分组回测 / Top-N 组合 / 对冲超额收益
+
+说明：
+- 基准为「板块内全部股票等权平均收益」，不依赖 tushare 指数数据。
+- 数据来自本地 comm_data 目录（comm_price_qfq.csv / comm_daily_basic.csv）。
+- 依赖：pandas numpy tqdm matplotlib seaborn scikit-learn torch
+- 训练较重，建议有 GPU；可用下面的超参数调小 EPOCHS / N_SPLITS 加快。
+"""
+
+import os
+# 强制单线程数值库：numpy/pandas 的多线程浮点归约顺序不固定，会让量价因子的 NaN 掩码
+#（进而 valid_ratio 过滤掉多少样本）在每次运行间轻微漂移；统一钉成单线程以保证可复现
+for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+           'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+    os.environ.setdefault(_v, '1')
+# CuBLAS 确定性所需（必须在任何 CUDA 运算之前设置）
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
+import time
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import glob
+import matplotlib
+matplotlib.use('Agg')   # 批量运行统一用非交互后端：plt.show() 变为空操作，避免开窗阻塞；图会存到 figs/
+import matplotlib.pyplot as plt
+
+debug = False
+from datetime import datetime
+
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
+
+# =====================================================================
+# 全局配置
+# =====================================================================
+SPLIT_DATE = '20250101'   # 训练集 < 该日期，测试集 > 该日期
+SEED = 42
+
+SEQ_LEN = 20              # 每只股票输入给 Transformer 的历史窗口长度（交易日）
+BATCH_SIZE = 512
+EPOCHS = 5                # 每个 fold 训练轮数
+LR = 5e-4
+WEIGHT_DECAY = 1e-4
+D_MODEL = 64
+NHEAD = 4
+NUM_LAYERS = 2
+DIM_FF = 128
+DROPOUT = 0.1
+N_SPLITS = 5              # 交叉验证折数（Transformer 较重，默认比原 LightGBM 的 10 折少）
+TARGET_SCALE = 100.0      # 目标收益放大倍数，稳定训练；预测时再除回来
+
+USE_AMP = True            # GPU 混合精度（自动在 CPU 上关闭）
+# DataLoader 进程数：Windows 用 spawn 会重复导入脚本，必须为 0；Linux 可多进程加速
+NUM_WORKERS = 0 if os.name == 'nt' else 4
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.benchmark = False         # 关闭非确定性加速，保证可复现
+    torch.backends.cudnn.deterministic = True
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        # 关掉 flash / memory-efficient SDPA，强制走 math 路径（配合 CUBLAS_WORKSPACE_CONFIG 才真正确定）
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+use_amp = USE_AMP and device.type == 'cuda'
+pin_memory = device.type == 'cuda'
+scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+print('Using device:', device, '| AMP:', use_amp)
+if device.type == 'cuda':
+    print('GPU:', torch.cuda.get_device_name(0))
+
+# 图形保存/展示（远程无显示时也能把图存到 figs/ 下）
+FIG_DIR = os.path.join(os.getcwd(), 'figs')
+os.makedirs(FIG_DIR, exist_ok=True)
+
+
+def save_show(name):
+    path = os.path.join(FIG_DIR, f'{name}.png')
+    plt.savefig(path, bbox_inches='tight')
+    print('saved figure:', path)
+    plt.show()
+    plt.close()
+
+
+# =====================================================================
+# 生成 Alpha 因子的基础函数
+# =====================================================================
+def ts_sum(df, window=10):
+    return df.rolling(window).sum()
+
+def sma(df, window=10):
+    return df.rolling(window).mean()
+
+def ts_min(df, window=10):
+    return df.rolling(window).min()
+
+def ts_median(df, window=10):
+    return df.rolling(window).median()
+
+def ts_max(df, window=10):
+    return df.rolling(window).max()
+
+def delta(df, period=1):
+    return df.diff(period)
+
+def delay(df, period=1):
+    return df.shift(period)
+
+def rank(df):
+    return df.rank(axis=1, pct=True)
+
+def ts_argmax(df, window=10):
+    return df.rolling(window).apply(np.argmax) + 1
+
+
+# =====================================================================
+# 一系列 Alpha 因子
+# =====================================================================
+class AlphaLib(object):
+    def __init__(self, daily_info):
+        self.open = daily_info['open']
+        self.high = daily_info['high']
+        self.low = daily_info['low']
+        self.close = daily_info['close']
+        self.vwap = daily_info['vwap']
+        self.volume = daily_info['volume']
+        self.amount = daily_info['amount']
+
+    def calcu_alpha(self):
+        alpha_dict = {}
+        alpha_dict['alpha01'] = ((self.close / sma(self.close, 10) - 1) * self.amount).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha02'] = sma(self.amount, 5).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha06'] = sma((self.close / sma(self.close, 5) - 1) * self.amount, 5).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha07'] = ts_max((self.close / sma(self.close, 15) - 1) * self.amount, 15).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha08'] = ts_min((self.close / ts_max(self.close, 60) - 1) * self.amount, 10).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha09'] = ts_max((self.close / ts_min(self.close, 60) - 1) * self.amount, 50).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha10'] = ts_max((self.close / ts_min(self.close, 20) - 1) * self.amount, 15).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha12'] = ts_max((ts_max(self.high, 30) / ts_min(self.low, 30) - 1) * self.amount, 20).div(self.amount.sum(1), axis=0)
+        alpha_dict['alpha13'] = ts_max(self.high - self.low, 30) / ts_min(self.close + self.open, 30)
+        alpha_dict['alpha14'] = ts_sum(self.amount * (self.close - self.open), 5)
+        alpha_dict['alpha15'] = ts_max(self.amount * (self.high - self.low), 15)
+        alpha_dict['alpha16'] = ts_sum(self.amount * (self.close - self.vwap), 5)
+        alpha_dict['alpha17'] = ts_min(self.amount * (self.low - self.vwap), 15)
+        alpha_dict['alpha18'] = ts_min(self.amount * (self.open - self.vwap), 15)
+        alpha_dict['alpha19'] = ts_min(self.amount * (self.open - self.low), 10)
+        alpha_dict['alpha20'] = ts_max(self.amount * (self.close - self.low), 10)
+        alpha_dict['alpha21'] = ts_median(self.amount, 15) / ts_sum(self.amount, 15)
+        alpha_dict['alpha23'] = ts_max(self.amount, 15) / ts_min(self.amount, 10)
+        alpha_dict['alpha24'] = ts_sum(self.amount.div(self.amount.sum(1), axis=0), 5)
+        alpha_dict['alpha28'] = (ts_max(self.close, 5) / delay(self.close, 5)) * ts_min(self.close, 5) / self.close
+
+        tmp2 = abs((self.close - self.open) / (self.high - self.low + 0.01))
+        alpha_dict['alpha29'] = ts_max(tmp2, 6) / ts_min(tmp2, 6)
+        alpha_dict['alpha30'] = tmp2 / delay(tmp2, 4)
+
+        tmp3 = abs((self.low - self.open) / (self.close - self.low + 0.01))
+        alpha_dict['alpha31'] = ts_max(tmp3, 4) / ts_min(tmp3, 4)
+
+        tmp4 = abs((self.high - self.open) / (self.close - self.low + 0.01))
+        alpha_dict['alpha32'] = ts_max(tmp4, 2) / ts_min(tmp4, 2)
+
+        alpha_dict['alpha_w_005'] = (rank((self.open - (ts_sum(self.vwap, 10) / 10))) * (-1 * abs(rank((self.close - self.vwap)))))
+        alpha_dict['alpha_pe'] = -1 * daily_info['pe_ttm']
+        alpha_dict['alpha_total_mv'] = daily_info['total_mv']
+        alpha_dict['alpha_pb'] = -1 * daily_info['pb']
+        alpha_dict['alpha_turnover_rate'] = daily_info['turnover_rate']
+        alpha_dict['alpha_volume_ratio'] = daily_info['volume_ratio']
+        alpha_dict['alpha_vwap'] = daily_info['vwap']
+        alpha_dict['alpha_dv_ttm'] = -1 * daily_info['dv_ttm']
+        return alpha_dict
+
+
+# =====================================================================
+# Alpha 因子质量评估 + 质量门槛（来自 alpha_quality.py）
+# ---------------------------------------------------------------------
+# 说明：本段原为独立模块 alpha_quality.py，现并入本文件统一管理。
+# 为避免与下方已有的 max_dd / calc_pfmc 冲突，这里将两者重命名为
+# aq_max_dd / aq_calc_pfmc，其余函数与常量保持原样。
+#
+# 约定输入因子表 alpha 需包含以下列：
+#     ts_code, trade_date, factor, ret1, industry
+# 其中 ret1 为下一期收益（收益倍数）。
+# =====================================================================
+
+DEFAULT_QUALITY_THRESHOLDS = {
+    # 多空组合（diff）夏普比率下限
+    "min_diff_sharpe": 1.5,
+    # 多空组合年化收益下限
+    "min_diff_return": 0.0,
+    # 信息系数（IC）绝对值下限
+    "min_abs_ic": 0.02,
+    # 信息比率（ICIR = IC_mean / IC_std）绝对值下限
+    "min_abs_icir": 0.3,
+    # 多空最大回撤容忍度（负数，越大越严格；如 -0.3 表示回撤不超过 30%）
+    "max_diff_mdd": -0.30,
+    # 多空胜率下限
+    "min_diff_winratio": 0.50,
+    # 单调性：top 与 bottom 组收益方向是否与因子方向一致（True=要求单调）
+    "require_monotonic": True,
+}
+
+
+def bin_factor_rank(x):
+    """把 0~1 的分位排名映射到 1~10 的十分位分组。"""
+    if np.isnan(x):
+        return np.nan
+    else:
+        return min(10, int(x * 10) + 1)
+
+
+def build_ret_pd(alpha):
+    """
+    构造各分组的按期收益矩阵，并生成多空组合 diff 列。
+
+    参数
+    ----
+    alpha : DataFrame
+        需包含列 ['factor_rank_bin', 'trade_date', 'ret1']，且已完成 factor_rank_bin 赋值。
+
+    返回
+    ----
+    ret_PD : DataFrame
+        index 为 trade_date，列为 1~10 分组以及 'diff'（多空收益）。
+    """
+    ret_PD = (alpha.groupby(["factor_rank_bin", "trade_date"]).ret1.mean() - 1.00).unstack().T
+
+    # 多空组合方向：取 top/bottom 中收益更高的方向为多头端
+    if ret_PD[1].mean() > ret_PD[10].mean():
+        ret_PD["diff"] = ret_PD[1] - ret_PD[10]
+    else:
+        ret_PD["diff"] = ret_PD[10] - ret_PD[1]
+
+    return ret_PD
+
+
+def aq_max_dd(returns):
+    """
+    计算最大回撤及起止日期（基于复利净值）。
+
+    returns 为逐期简单收益（ret_PD 里的 ret-1 已是净值口径）。
+    用 (1+r).cumprod() 构造净值再算回撤，避免 cumsum 在「重叠期收益」下
+    累加穿过 -100% 产生 < -1 的伪回撤。
+    """
+    nav = (1.0 + returns.fillna(0.0)).cumprod()
+    dd = nav.div(nav.cummax()).sub(1.0)
+    mdd = dd.min()
+    end = returns.index[dd.argmin()]
+    start = returns.index[nav.loc[:end].argmax()]
+    return mdd, start, end
+
+
+def aq_calc_pfmc(ret_PD, groups=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "diff"), horizon=1):
+    """
+    计算每个分组的绩效指标：年化收益、夏普比率、波动、胜率、最大回撤。
+
+    参数
+    ----
+    ret_PD : DataFrame
+        build_ret_pd 的输出（每列为「horizon 日」的简单收益）。
+    groups : iterable
+        需要计算的分组列，默认 1~10 以及 'diff'。
+    horizon : int
+        每期收益跨越的交易日数（ret1=1、ret5=5）。
+        年化按每年 252/horizon 期折算，避免把 5 日收益当每日收益而放大 √horizon 倍。
+
+    返回
+    ----
+    performance : DataFrame
+        columns = ['group_name', 'return', 'sharpe', 'std', 'winratio', 'mdd']
+    """
+    periods_per_year = 252.0 / float(horizon)
+    performance = []
+    for i in groups:
+        returnlist = ret_PD[i]
+        mean_p = returnlist.mean()
+        std_p = returnlist.std()
+        ret_year = mean_p * periods_per_year                                    # 年化收益
+        ret_sharpe = (mean_p / std_p * (periods_per_year ** 0.5)) if std_p > 0 else np.nan  # 年化夏普
+        max_draw, start, end = aq_max_dd(returnlist)                            # 最大回撤（复利）
+        winratio = (returnlist > 0).sum() / len(returnlist)                     # 胜率
+        performance.append([i, ret_year, ret_sharpe, std_p, winratio, max_draw])
+
+    performance = pd.DataFrame(
+        performance,
+        columns=["group_name", "return", "sharpe", "std", "winratio", "mdd"],
+    )
+    return performance
+
+
+def calc_ic_series(alpha):
+    """
+    计算每日横截面 IC（factor 与 ret1 的相关系数）序列，index 为 trade_date。
+    """
+    ic = alpha.groupby(["trade_date"])[["factor", "ret1"]].corr()["factor"].reset_index()
+    ic = ic[ic.level_1 == "ret1"]
+    ic = ic[["trade_date", "factor"]].set_index("trade_date")
+    ic = ic.rename(columns={"factor": "IC"})
+    return ic
+
+
+def calc_icir(ic_series):
+    """计算 IC 均值与 ICIR（= IC均值 / IC标准差）。"""
+    ic_mean = ic_series["IC"].mean()
+    ic_std = ic_series["IC"].std()
+    icir = ic_mean / ic_std if ic_std != 0 else np.nan
+    return {"ic_mean": ic_mean, "ic_std": ic_std, "icir": icir}
+
+
+def evaluate_alpha(alpha, horizon=1):
+    """
+    对一个 alpha 因子做完整质量评估，输出全部关键指标。
+
+    参数
+    ----
+    alpha : DataFrame
+        需包含列 ['ts_code', 'trade_date', 'factor', 'ret1', 'industry']。
+        若不含 factor_rank / factor_rank_bin，会自动计算。
+    horizon : int
+        输入 ret1 列所代表的收益跨度（交易日数）：ret1=1、ret5=5。
+        用于把分组业绩按正确频率年化，避免口径失真。
+
+    返回
+    ----
+    result : dict
+        {
+            'factor_rank': DataFrame,   # 带分位排名与分箱后的 alpha
+            'ret_PD': DataFrame,        # 分组收益矩阵（含 diff）
+            'performance': DataFrame,   # 分组绩效（含夏普等）
+            'ic_series': DataFrame,     # IC 时间序列
+            'ic_mean': float,
+            'ic_std': float,
+            'icir': float,
+            'summary': dict,            # 汇总的关键指标（便于做门槛判断）
+        }
+    """
+    alpha = alpha.copy()
+
+    # 分位排名（按日期 + 行业做横截面排名）
+    if "factor_rank" not in alpha.columns:
+        alpha["factor_rank"] = alpha.groupby(["trade_date", "industry"]).factor.rank(pct=True)
+
+    # 十分位分箱
+    if "factor_rank_bin" not in alpha.columns:
+        alpha["factor_rank_bin"] = alpha.factor_rank.apply(bin_factor_rank)
+
+    # 分组收益 + 绩效
+    ret_PD = build_ret_pd(alpha)
+    performance = aq_calc_pfmc(ret_PD, horizon=horizon)
+
+    # IC / ICIR
+    ic_series = calc_ic_series(alpha)
+    ic_stats = calc_icir(ic_series)
+
+    # 多空组合指标
+    diff_row = performance[performance.group_name == "diff"].iloc[0]
+
+    # 单调性判断：1~10 组收益是否单调（方向与 diff 一致）
+    group_returns = (
+        performance[performance.group_name != "diff"]
+        .sort_values("group_name")["return"]
+        .values
+    )
+    inc = np.all(np.diff(group_returns) >= 0)
+    dec = np.all(np.diff(group_returns) <= 0)
+    monotonic = bool(inc or dec)
+
+    summary = {
+        "diff_return": float(diff_row["return"]),
+        "diff_sharpe": float(diff_row["sharpe"]),
+        "diff_std": float(diff_row["std"]),
+        "diff_winratio": float(diff_row["winratio"]),
+        "diff_mdd": float(diff_row["mdd"]),
+        "ic_mean": float(ic_stats["ic_mean"]),
+        "ic_std": float(ic_stats["ic_std"]),
+        "icir": float(ic_stats["icir"]),
+        "monotonic": monotonic,
+    }
+
+    return {
+        "factor_rank": alpha,
+        "ret_PD": ret_PD,
+        "performance": performance,
+        "ic_series": ic_series,
+        "ic_mean": ic_stats["ic_mean"],
+        "ic_std": ic_stats["ic_std"],
+        "icir": ic_stats["icir"],
+        "summary": summary,
+    }
+
+
+def pass_quality_gate(summary, thresholds=None):
+    """
+    根据质量门槛判断 alpha 因子是否合格。
+
+    参数
+    ----
+    summary : dict
+        evaluate_alpha(...)['summary'] 的输出。
+    thresholds : dict, optional
+        门槛字典，缺省使用 DEFAULT_QUALITY_THRESHOLDS。
+
+    返回
+    ----
+    (passed, detail) : (bool, dict)
+        passed 为是否全部达标；detail 给出每一项的判定结果。
+    """
+    t = dict(DEFAULT_QUALITY_THRESHOLDS)
+    if thresholds:
+        t.update(thresholds)
+
+    checks = {
+        "diff_sharpe>=门槛": summary["diff_sharpe"] >= t["min_diff_sharpe"],
+        "diff_return>=门槛": summary["diff_return"] >= t["min_diff_return"],
+        "|IC|>=门槛": abs(summary["ic_mean"]) >= t["min_abs_ic"],
+        "|ICIR|>=门槛": abs(summary["icir"]) >= t["min_abs_icir"],
+        "diff_mdd可接受": summary["diff_mdd"] >= t["max_diff_mdd"],
+        "diff_winratio>=门槛": summary["diff_winratio"] >= t["min_diff_winratio"],
+    }
+    if t.get("require_monotonic", False):
+        checks["分组收益单调"] = bool(summary["monotonic"])
+
+    passed = all(checks.values())
+    detail = {
+        "thresholds": t,
+        "checks": checks,
+        "summary": summary,
+    }
+    return passed, detail
+
+
+# =====================================================================
+# 生成训练集（与 LightGBM 版一致）
+# =====================================================================
+def _resolve_comm_dir():
+    """按优先级查找数据目录，兼容本地 Windows 与远程 Linux/GPU 环境。"""
+    candidates = [
+        os.environ.get('COMM_DIR'),
+        r'C:\Users\15612\Desktop\quant\comm_data',
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'comm_data') if '__file__' in globals() else None,
+        os.path.join(os.getcwd(), 'comm_data'),
+    ]
+    for c in candidates:
+        if c and os.path.isdir(c):
+            return c
+    raise FileNotFoundError('未找到 comm_data 目录，请设置环境变量 COMM_DIR 指向数据目录')
+
+
+COMM_DIR = _resolve_comm_dir()
+print('COMM_DIR =', COMM_DIR)
+price_PD_total = pd.read_csv(os.path.join(COMM_DIR, 'comm_price_qfq.csv'), dtype={'trade_date': 'str'})
+price_PD_total = price_PD_total.drop_duplicates(['ts_code', 'trade_date']).sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
+
+# 通信板块即单一行业：name 用代码代替，industry/market 置为常量，便于后续按 trade_date+industry 做横截面排名
+price_PD_total['name'] = price_PD_total['ts_code']
+price_PD_total['industry'] = '通信'
+price_PD_total['market'] = '通信'
+
+price_PD_total = price_PD_total[['ts_code', 'name', 'market', 'industry', 'trade_date', 'open', 'high', 'low',
+                                 'close', 'pre_close', 'change', 'pct_chg', 'vol', 'amount']]
+
+daily_basic = pd.read_csv(os.path.join(COMM_DIR, 'comm_daily_basic.csv'), dtype={'trade_date': 'str'})
+print(daily_basic)
+
+price_PD_total = pd.merge(price_PD_total, daily_basic, how='left', on=['ts_code', 'trade_date'])
+
+# 买入日开盘相对前收的涨幅：t+1 开盘 / t 收盘（策略为 t+1 开盘买入，用它判断能否成交）
+price_PD_total['open_up_t1'] = (price_PD_total.groupby('ts_code').open.shift(-1)
+                                / price_PD_total.groupby('ts_code').close.shift(0))
+
+
+def _limit_ratio(code):
+    """按板块推断涨跌停幅度（不含 ST）。"""
+    if code.startswith(('688', '689')):      # 科创板
+        return 0.20
+    if code.startswith(('300', '301')):      # 创业板（注册制）
+        return 0.20
+    if code.startswith(('8', '4', '920')):   # 北交所
+        return 0.30
+    return 0.10                              # 主板
+
+
+price_PD_total['limit_pct'] = price_PD_total['ts_code'].map(_limit_ratio)
+# 买入日开盘未触及涨跌停（留 0.5% 缓冲）才视为可成交；与 NaN 比较自然得到 False
+price_PD_total['buy_tradable'] = (
+    (price_PD_total['open_up_t1'] < 1 + price_PD_total['limit_pct'] - 0.005)
+    & (price_PD_total['open_up_t1'] > 1 - price_PD_total['limit_pct'] + 0.005)
+).astype(bool)
+
+# t收盘买 t+1收盘卖
+price_PD_total['ret1'] = price_PD_total.groupby('ts_code').close.shift(-1) / price_PD_total.groupby('ts_code').close.shift(0)
+# t+1开盘买 t+2收盘卖
+# price_PD_total['ret2'] = price_PD_total.groupby('ts_code').close.shift(-2)/price_PD_total.groupby('ts_code').open.shift(-1)
+# t+1开盘买 t+2开盘卖
+# price_PD_total['ret3'] = price_PD_total.groupby('ts_code').open.shift(-3)/price_PD_total.groupby('ts_code').open.shift(-1)
+# #t+1开盘买 t+3收盘卖
+# price_PD_total['ret4'] = price_PD_total.groupby('ts_code').close.shift(-3)/price_PD_total.groupby('ts_code').open.shift(-1)
+# #t+1开盘买 t+5收盘卖
+price_PD_total['ret5'] = price_PD_total.groupby('ts_code').close.shift(-5) / price_PD_total.groupby('ts_code').open.shift(-1)
+
+price_PD_total['ret'] = price_PD_total['ret5'].copy()
+
+daily_info = {}
+daily_info['open'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='open')
+daily_info['close'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='close')
+daily_info['high'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='high')
+daily_info['low'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='low')
+daily_info['volume'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='vol')
+daily_info['amount'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='amount')
+daily_info['vwap'] = (daily_info['amount'] * 1000) / (daily_info['volume'] * 100 + 1)
+daily_info['pe_ttm'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='pe_ttm')
+daily_info['total_mv'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='total_mv')
+daily_info['pb'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='pb')
+daily_info['turnover_rate'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='turnover_rate')
+daily_info['volume_ratio'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='volume_ratio')
+daily_info['dv_ttm'] = pd.pivot(price_PD_total, index='trade_date', columns='ts_code', values='dv_ttm')
+
+tmp_class = AlphaLib(daily_info)
+alpha_dict = tmp_class.calcu_alpha()
+
+data = pd.DataFrame()
+for k, v in tqdm(alpha_dict.items(), desc='building factor table'):
+    tmp = v.unstack().reset_index().rename(columns={0: k})
+    if len(data) == 0:
+        data = tmp
+    else:
+        data = pd.merge(data, tmp, how='left', on=['ts_code', 'trade_date'])
+
+data = pd.merge(data, price_PD_total[['trade_date', 'ts_code', 'name', 'ret1', 'ret5',
+                                       'ret', 'open_up_t1', 'buy_tradable']], how='left', on=['trade_date', 'ts_code'])
+print(data)
+
+# ===== 数据自检：防止目标退化（全 0 / 常量）导致“假收敛” =====
+print('[sanity] price ret5 describe:\n', price_PD_total['ret5'].describe())
+print(f"[sanity] data.ret mean={data['ret'].mean():.4f} std={data['ret'].std():.4f} "
+      f"nan={int(data['ret'].isna().sum())} zeros={int((data['ret'] == 0).sum())}")
+if not (data['ret'].std() > 0.01):
+    raise ValueError('ret 目标退化（std 过小或全为 0），请检查 ret5/ret 计算与合并；'
+                     '确认运行的是已保存的最新 part04_lgb.py')
+
+features = ['alpha01', 'alpha02', 'alpha06', 'alpha07',
+            'alpha08', 'alpha09', 'alpha10', 'alpha12', 'alpha13', 'alpha14',
+            'alpha15', 'alpha16', 'alpha17', 'alpha18', 'alpha19', 'alpha20',
+            'alpha21', 'alpha23', 'alpha24', 'alpha28', 'alpha29', 'alpha30',
+            'alpha31', 'alpha32', 'alpha_w_005', 'alpha_pe', 'alpha_total_mv',
+            'alpha_pb', 'alpha_turnover_rate', 'alpha_volume_ratio', 'alpha_vwap',
+            'alpha_dv_ttm']
+
+# 估值/流动性类因子（daily_basic 来源，结构性缺失多），valid_ratio 只用量价因子计算
+valuation_features = ['alpha_pe', 'alpha_total_mv', 'alpha_pb', 'alpha_turnover_rate',
+                      'alpha_volume_ratio', 'alpha_vwap', 'alpha_dv_ttm']
+price_features = [f for f in features if f not in valuation_features]
+MIN_VALID_RATIO = 0.7   # 20 天窗口内有效量价特征占比低于此值则丢弃该样本（0.7 收回部分低信息窗口）
+
+
+# =====================================================================
+# 因子质量诊断 + 筛选（拟合之前先筛干净因子）
+# ---------------------------------------------------------------------
+# 思路：好的因子比模型更重要。先用 evaluate_alpha / pass_quality_gate 在
+# 【训练期数据】上对每个候选因子做分组 / IC / ICIR / 回撤 / 单调性诊断，
+# 再按「硬性排除 + |ICIR| 排序取 top-K」选出优质因子送进 Transformer 拟合。
+# 用训练期（trade_date < SPLIT_DATE）筛选，避免用未来信息挑因子造成选择偏差。
+# 业绩口径按真实 horizon（ret5=5 日）年化，且回撤用复利净值，杜绝口径失真。
+# =====================================================================
+FACTOR_SCREEN_ENABLE = True
+FACTOR_EVAL_RET = 'ret5'          # 诊断因子所用收益口径：'ret1'(次日) 或 'ret5'/'ret'(5日，与模型目标一致)
+FACTOR_TOP_K = 8                  # 硬性排除后，按 |ICIR| 排序保留的因子数
+FACTOR_MIN_WINRATE = 0.50         # 硬性排除：多空组合胜率下限（剔除 alpha19 这类极端偏态/脆弱因子）
+FACTOR_MAX_MDD = -0.95            # 硬性排除：仅兜住接近清零的极端回撤；正常优质因子 5 日 MDD 常在 -50%~-90%，勿用 -0.5 卡死
+FACTOR_MIN_ABS_ICIR = 0.05        # 硬性排除：|ICIR| 下限，剔除纯噪声因子
+FACTOR_QUALITY_THRESHOLDS = None  # None=用 DEFAULT_QUALITY_THRESHOLDS；仅用于报告 passed，不影响选因子
+
+_DATA_INDUSTRY = '通信'
+_EVAL_HORIZON = {'ret1': 1, 'ret5': 5, 'ret': 5}   # 收益口径 -> 每期交易日数
+
+
+def screen_factor_quality(data, features, ret_col='ret5', thresholds=None,
+                          top_k=8, min_winratio=0.50, max_mdd=-0.95, min_abs_icir=0.05):
+    """
+    在训练期数据上对每个因子做质量诊断，并按 |ICIR| 选出 top-K。
+
+    选择逻辑（与回测口径一致，且不依赖会被污染的 sharpe/mdd 门槛）：
+      1) 硬性排除：多空胜率 < min_winratio 或 多空最大回撤 < max_mdd 的因子直接淘汰；
+      2) 其余按 |ICIR| 从高到低排序，取前 top_k 个。
+    passed（是否过 DEFAULT 门槛）只作报告信息，不参与最终选择。
+
+    返回
+    ----
+    report : DataFrame   每个因子一行的诊断结果（含 eligible / passed / 关键指标）
+    selected : list      入选因子名（保持原始顺序）
+    """
+    horizon = _EVAL_HORIZON.get(ret_col, 1)
+    screen = data[data['trade_date'] < SPLIT_DATE]
+    rows = []
+    for feat in tqdm(features, desc='factor quality screen'):
+        alpha = pd.DataFrame({
+            'ts_code': screen['ts_code'].values,
+            'trade_date': screen['trade_date'].values,
+            'industry': _DATA_INDUSTRY,
+            'factor': pd.to_numeric(screen[feat], errors='coerce').replace([np.inf, -np.inf], np.nan).values,
+            'ret1': pd.to_numeric(screen[ret_col], errors='coerce').replace([np.inf, -np.inf], np.nan).values,
+        })
+        try:
+            res = evaluate_alpha(alpha, horizon=horizon)
+            summary = res['summary']
+            passed, _ = pass_quality_gate(summary, thresholds=thresholds)
+            rows.append({
+                'feature': feat,
+                'diff_sharpe': summary['diff_sharpe'],
+                'diff_return': summary['diff_return'],
+                'diff_winratio': summary['diff_winratio'],
+                'diff_mdd': summary['diff_mdd'],
+                'ic_mean': summary['ic_mean'],
+                'ic_std': summary['ic_std'],
+                'icir': summary['icir'],
+                'monotonic': summary['monotonic'],
+                'passed': bool(passed),
+                'error': '',
+            })
+        except Exception as e:
+            # 某些因子（全 NaN / 常量 / 分档缺失）无法诊断，记为未通过并记录原因
+            rows.append({
+                'feature': feat, 'diff_sharpe': np.nan, 'diff_return': np.nan,
+                'diff_winratio': np.nan, 'diff_mdd': np.nan, 'ic_mean': np.nan,
+                'ic_std': np.nan, 'icir': np.nan, 'monotonic': False, 'passed': False,
+                'error': str(e),
+            })
+    report = pd.DataFrame(rows)
+    report['abs_icir'] = report['icir'].abs()
+
+    # 1) 硬性排除：胜率过低 / 回撤接近清零 / |ICIR| 过小（纯噪声）的因子直接淘汰
+    hard_ok = ((report['diff_winratio'] >= min_winratio)
+               & (report['diff_mdd'] >= max_mdd)
+               & (report['abs_icir'] >= min_abs_icir))
+    report['eligible'] = hard_ok
+
+    # 2) 合格因子按 |ICIR| 取 top-K
+    eligible = report.loc[hard_ok].sort_values('abs_icir', ascending=False, na_position='last')
+    selected_feats = eligible['feature'].head(top_k).tolist()
+
+    # 安全兜底：若硬性排除后不足 2 个，退回全体按 |ICIR| 取 top-K，保证仍能训练
+    if len(selected_feats) < 2:
+        print('[warn] 硬性排除后候选因子不足 2 个，回退为全体按 |ICIR| 取 top-K')
+        selected_feats = (report.sort_values('abs_icir', ascending=False, na_position='last')
+                          ['feature'].head(top_k).tolist())
+
+    selected_set = set(selected_feats)
+    selected = [f for f in features if f in selected_set]   # 保持原始因子顺序
+    return report, selected
+
+
+factor_screen_report = None
+if FACTOR_SCREEN_ENABLE:
+    factor_screen_report, _selected_features = screen_factor_quality(
+        data, features, ret_col=FACTOR_EVAL_RET, thresholds=FACTOR_QUALITY_THRESHOLDS,
+        top_k=FACTOR_TOP_K, min_winratio=FACTOR_MIN_WINRATE, max_mdd=FACTOR_MAX_MDD,
+        min_abs_icir=FACTOR_MIN_ABS_ICIR)
+
+    _rep_show = factor_screen_report.sort_values(
+        by=['eligible', 'abs_icir'], ascending=[False, False], na_position='last')
+    print('\n[因子质量筛选] 口径=%s(horizon=%d) | 过 DEFAULT 门槛 %d/%d | 硬性排除后合格 %d 个 | 按|ICIR|取前 %d 送入模型'
+          % (FACTOR_EVAL_RET, _EVAL_HORIZON.get(FACTOR_EVAL_RET, 1),
+             int(factor_screen_report['passed'].sum()), len(features),
+             int(factor_screen_report['eligible'].sum()), len(_selected_features)))
+    print(_rep_show[['feature', 'diff_sharpe', 'diff_return', 'diff_winratio',
+                     'diff_mdd', 'ic_mean', 'icir', 'monotonic', 'eligible', 'passed']].to_string(index=False))
+
+    if _selected_features:
+        features = _selected_features
+        valuation_features = [f for f in valuation_features if f in set(features)]
+        price_features = [f for f in features if f not in valuation_features]
+        print('送入 Transformer 的因子:', features)
+        if len(features) < 2:
+            raise RuntimeError('筛选后因子数不足 2 个，请放宽 FACTOR_MIN_WINRATE / FACTOR_MAX_MDD 或调大 FACTOR_TOP_K')
+    else:
+        print('[warn] 筛选后无可用因子，保留原始全部因子继续训练')
+
+
+# =====================================================================
+# 特征标准化 + 按股票构造时间序列窗口
+# =====================================================================
+data = data.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
+
+# 清洗：alpha 里“除以 0”会产生 inf（不是 nan），必须先转成 nan 再处理
+data[features] = data[features].replace([np.inf, -np.inf], np.nan)
+data['ret'] = data['ret'].replace([np.inf, -np.inf], np.nan)
+data['ret1'] = data['ret1'].replace([np.inf, -np.inf], np.nan)
+
+# 只用训练期统计量做标准化，避免测试期信息泄露
+train_rows = data['trade_date'] < SPLIT_DATE
+feat_mean = data.loc[train_rows, features].mean().fillna(0.0)
+feat_std = (data.loc[train_rows, features].std().fillna(1.0)
+            .replace(0.0, 1.0).clip(lower=1e-6))   # 防止方差过小导致数值爆炸
+# 必须在 fillna 之前记录量价因子的原始缺失掩码：fillna 之后就看不出 NaN 了
+raw_nan_mask = data[price_features].isna().values   # (N, n_price)，行序与 data 一致
+if os.environ.get('QUANT_DIAG_STOP') == '1':
+    import hashlib as _hl0
+    print('[DIAG] data_len=%d  nanmask_md5=%s  ret_md5=%s' % (
+        len(data),
+        _hl0.md5(np.ascontiguousarray(raw_nan_mask).tobytes()).hexdigest(),
+        _hl0.md5(np.ascontiguousarray(np.nan_to_num(data['ret'].values.astype(np.float64))).tobytes()).hexdigest()))
+data[features] = (data[features].fillna(feat_mean) - feat_mean) / feat_std
+data[features] = data[features].clip(-10.0, 10.0)   # 截断极端值，避免 fp16 溢出
+
+# 训练标签 Winsorize（只用训练期 1%/99% 分位数）：抑制复牌连板等极端 ret 撑爆 MSE
+# 注意：只作用于训练标签 ret_label，回测仍使用原始 ret，避免污染评估
+train_ret = data.loc[train_rows, 'ret'].dropna()
+ret_lo, ret_hi = train_ret.quantile(0.01), train_ret.quantile(0.99)
+data['ret_label'] = data['ret'].clip(lower=ret_lo, upper=ret_hi)
+print(f'[winsor] ret_label clipped to [{ret_lo:.4f}, {ret_hi:.4f}] (train 1%/99%)')
+
+arrays_by_code = {}
+train_samples, test_samples = [], []
+test_meta = []
+n_valid_dropped = 0   # 统计被 valid_ratio 过滤掉的窗口数
+
+for code, g in tqdm(data.groupby('ts_code', sort=False), desc='building sequences'):
+    feat = g[features].values.astype(np.float32)   # (T, F)
+    ret = g['ret_label'].values.astype(np.float32)   # (T,) 缩尾后的训练/评估标签
+    dates = g['trade_date'].values                  # (T,)
+    arrays_by_code[code] = (feat, ret, dates)
+    mask = raw_nan_mask[g.index.values]             # (T, n_price)，True=原始缺失
+
+    T = len(dates)
+    if T < SEQ_LEN:
+        continue
+    for end in range(SEQ_LEN - 1, T):
+        # 有效信息不足（窗口内量价因子大量为 NaN）则丢弃，训练/预测都过滤，杜绝“零信息同分”
+        if (~mask[end - SEQ_LEN + 1: end + 1]).mean() < MIN_VALID_RATIO:
+            n_valid_dropped += 1
+            continue
+        d = dates[end]
+        if d < SPLIT_DATE:
+            # 训练样本必须有有限的目标值（排除 nan 和 inf）
+            if np.isfinite(ret[end]):
+                train_samples.append((code, end))
+        elif d > SPLIT_DATE:
+            # 测试样本即使目标为 NaN 也要预测（用于横截面排名）
+            test_samples.append((code, end))
+            test_meta.append((code, d))
+
+print(f'train samples: {len(train_samples)}, test samples: {len(test_samples)}, '
+      f'valid_ratio dropped: {n_valid_dropped}')
+if os.environ.get('QUANT_DIAG_STOP') == '1':
+    import hashlib as _hl
+    _sig = _hl.md5(repr((len(train_samples), len(test_samples), n_valid_dropped,
+                         train_samples[:3], train_samples[-3:])).encode()).hexdigest()
+    print('[DIAG] stop after sequence build | sig =', _sig)
+    import sys as _sys
+    _sys.exit(0)
+
+
+class StockSeqDataset(Dataset):
+    """惰性构造窗口：只存每只股票的整段序列，取样本时再切窗口，省内存。"""
+
+    def __init__(self, arrays_by_code, samples, seq_len):
+        self.arrays = arrays_by_code
+        self.samples = samples
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        code, end = self.samples[idx]
+        feat, ret, dates = self.arrays[code]
+        window = np.ascontiguousarray(feat[end - self.seq_len + 1: end + 1])
+        y = ret[end]
+        return torch.from_numpy(window), torch.tensor(y, dtype=torch.float32)
+
+
+class StockTransformer(nn.Module):
+    def __init__(self, n_features, seq_len, d_model=64, nhead=4, num_layers=2, dim_ff=128, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(n_features, d_model)
+        self.pos_enc = nn.Parameter(torch.zeros(1, seq_len, d_model))
+        nn.init.normal_(self.pos_enc, std=0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=dropout, batch_first=True, activation='gelu')
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, 1)
+
+    def forward(self, x):  # x: (B, L, F)
+        x = self.input_proj(x) + self.pos_enc[:, :x.size(1), :]
+        x = self.encoder(x)
+        x = self.norm(x[:, -1, :])   # 取最后时间步
+        return self.head(x).squeeze(-1)
+
+
+def run_epoch(model, loader, opt, loss_fn, train=True, desc=''):
+    """跑一个 epoch；eval 时对整批输出都保留预测（即使目标为空），保证与样本顺序对齐。"""
+    model.train() if train else model.eval()
+    total_loss, total_n = 0.0, 0
+    preds = []
+    pbar = tqdm(loader, desc=desc, unit='batch', leave=False)
+    for xb, yb in pbar:
+        xb = xb.to(device, non_blocking=True)
+        yb = ((yb - 1.0) * TARGET_SCALE).to(device, non_blocking=True)   # 回归超额收益 ret-1
+        mask = ~torch.isnan(yb)
+        if train:
+            if not mask.any():
+                continue
+            opt.zero_grad()
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                out = model(xb)
+                loss = loss_fn(out[mask], yb[mask])
+            if not torch.isfinite(loss):   # 保护：跳过异常 batch，避免 nan 污染权重
+                continue
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+            total_loss += loss.item() * int(mask.sum())
+            total_n += int(mask.sum())
+            pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+        else:
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=use_amp):
+                out = model(xb)
+                if mask.any():
+                    loss = loss_fn(out[mask], yb[mask])
+                    total_loss += loss.item() * int(mask.sum())
+                    total_n += int(mask.sum())
+                    pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+            # 评估时整批都保留预测（末尾“未来收益未知”的样本也要用于横截面排名）
+            preds.append(out.float().detach().cpu().numpy() / TARGET_SCALE)
+    avg = total_loss / max(total_n, 1)
+    if train:
+        return avg, None
+    return avg, (np.concatenate(preds) if preds else np.array([]))
+
+
+# =====================================================================
+# 交叉验证训练 Transformer（按时间顺序 + 隔离带的 walk-forward）
+# =====================================================================
+t_start = time.time()
+
+# 1) 先按交易日升序排序（同一支股票内部本就按时间有序），修复随机 KFold 的近邻泄露
+train_samples.sort(key=lambda s: arrays_by_code[s[0]][2][s[1]])
+sample_dates = np.array([arrays_by_code[c][2][e] for c, e in train_samples])   # 升序日期
+
+# 2) 目标值必须在排序之后重算，否则下标与 val_idx 错位
+train_y_all = np.array([arrays_by_code[c][1][e] - 1.0 for c, e in train_samples], dtype=np.float32)
+oof_predictions = np.full(len(train_samples), np.nan, dtype=np.float32)
+modellist = []
+
+# 3) 带隔离带（Purge/Embargo）的扩展窗口切分
+#    输入窗口 SEQ_LEN 天 + 标签跨度 5 天 => 至少 25 个交易日的隔离带，切断训练/验证交界泄露
+PURGE_GAP_DAYS = SEQ_LEN + 5
+uniq_dates = np.sort(np.unique(sample_dates))
+n_dates = len(uniq_dates)
+
+folds = []
+edges = np.linspace(0, n_dates, N_SPLITS + 2).astype(int)
+for k in range(N_SPLITS):
+    val_lo, val_hi = edges[k + 1], edges[k + 2]
+    if val_hi <= val_lo:
+        continue
+    purge_end = val_lo - PURGE_GAP_DAYS           # 训练集只能用到隔离带之前
+    if purge_end <= 0:
+        continue
+    train_last_date = uniq_dates[purge_end - 1]
+    val_first_date = uniq_dates[val_lo]
+    val_last_date = uniq_dates[val_hi - 1]
+    trn_idx = np.where(sample_dates <= train_last_date)[0]
+    val_idx = np.where((sample_dates >= val_first_date) & (sample_dates <= val_last_date))[0]
+    if len(trn_idx) < BATCH_SIZE or len(val_idx) == 0:
+        continue
+    folds.append((trn_idx, val_idx))
+
+if not folds:
+    raise RuntimeError('可用训练数据不足，无法构造带隔离带的 walk-forward 折，请检查 SPLIT_DATE / 数据长度')
+print(f'purged walk-forward folds: {len(folds)} (gap={PURGE_GAP_DAYS} trading days)')
+
+
+def _mean_rank_ic(pred, dates, act):
+    """逐日截面 Rank IC 的均值（Spearman），用于按“排序能力”挑模型。"""
+    df = pd.DataFrame({'d': dates, 'p': pred, 'a': act}).dropna()
+    if len(df) == 0:
+        return float('nan')
+    ic = (df.groupby('d')[['p', 'a']]
+          .apply(lambda g: g['p'].corr(g['a'], method='spearman') if len(g) > 1 else np.nan)
+          .dropna())
+    return float(ic.mean()) if len(ic) else float('nan')
+
+
+for fold, (trn_idx, val_idx) in enumerate(folds):
+    fold_t0 = time.time()
+    trn_samples = [train_samples[i] for i in trn_idx]
+    val_samples = [train_samples[i] for i in val_idx]
+
+    train_ds = StockSeqDataset(arrays_by_code, trn_samples, SEQ_LEN)
+    val_ds = StockSeqDataset(arrays_by_code, val_samples, SEQ_LEN)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=pin_memory)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=NUM_WORKERS, pin_memory=pin_memory)
+
+    model = StockTransformer(len(features), SEQ_LEN, D_MODEL, NHEAD, NUM_LAYERS, DIM_FF, DROPOUT).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    loss_fn = nn.MSELoss()
+
+    # 用【验证集 RankIC】而非 MSE 选模型：我们要的是横截面排序能力，不是拟合误差
+    best_ic, best_state, best_pred = -np.inf, None, None
+    for epoch in range(EPOCHS):
+        tr_loss, _ = run_epoch(model, train_loader, opt, loss_fn, train=True,
+                               desc=f'fold {fold + 1}/{len(folds)} epoch {epoch + 1}/{EPOCHS} train')
+        val_loss, val_pred = run_epoch(model, val_loader, opt, loss_fn, train=False,
+                                       desc=f'fold {fold + 1}/{len(folds)} epoch {epoch + 1}/{EPOCHS} val')
+        val_ic = _mean_rank_ic(val_pred, sample_dates[val_idx], train_y_all[val_idx])
+        print(f'[fold {fold + 1}] epoch {epoch + 1}/{EPOCHS} '
+              f'train_loss={tr_loss:.6f} val_loss={val_loss:.6f} val_RankIC={val_ic:.4f} '
+              f'elapsed={time.time() - fold_t0:.1f}s')
+        improved = (best_pred is None) or (np.isfinite(val_ic) and val_ic > best_ic)
+        if improved:
+            if np.isfinite(val_ic):
+                best_ic = val_ic
+            best_pred = val_pred.copy()
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    oof_predictions[val_idx] = best_pred if best_pred is not None else val_pred
+    modellist.append(model)
+    print(f'[fold {fold + 1}] done (best val RankIC={best_ic:.4f}), total elapsed {time.time() - t_start:.1f}s')
+
+# OOF 评估：逐日截面 Rank IC（Spearman），而不是会被时序相关性放大的池化 Pearson
+oof_df = pd.DataFrame({'date': sample_dates, 'act': train_y_all,
+                       'pred': oof_predictions}).dropna(subset=['act', 'pred'])
+rmse = np.sqrt(np.nanmean((oof_df['act'] - oof_df['pred']) ** 2))
+print(f'OOF RMSE = {rmse:.6f}')
+oof_ic = (oof_df.groupby('date')[['pred', 'act']]
+          .apply(lambda g: g['pred'].corr(g['act'], method='spearman') if len(g) > 1 else np.nan)
+          .dropna())
+if len(oof_ic):
+    print(f'OOF RankIC mean={oof_ic.mean():.4f} std={oof_ic.std():.4f} '
+          f'ICIR={oof_ic.mean() / oof_ic.std():.4f} days={len(oof_ic)}')
+
+oof_metrics = {
+    'OOF_RMSE': float(rmse),
+    'OOF_RankIC_mean': float(oof_ic.mean()) if len(oof_ic) else np.nan,
+    'OOF_RankIC_std': float(oof_ic.std()) if len(oof_ic) else np.nan,
+    'OOF_ICIR': float(oof_ic.mean() / oof_ic.std()) if len(oof_ic) and oof_ic.std() > 0 else np.nan,
+    'OOF_days': int(len(oof_ic)),
+}
+
+
+# =====================================================================
+# 测试集预测（多个 fold 模型取平均）
+# =====================================================================
+test_ds = StockSeqDataset(arrays_by_code, test_samples, SEQ_LEN)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                         num_workers=NUM_WORKERS, pin_memory=pin_memory)
+
+test_pred_sum = np.zeros(len(test_samples), dtype=np.float64)
+for model in tqdm(modellist, desc='ensemble predict'):
+    model.eval()
+    fold_preds = []
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=use_amp):
+        for xb, yb in tqdm(test_loader, desc='  test batch', unit='batch', leave=False):
+            xb = xb.to(device, non_blocking=True)
+            fold_preds.append(model(xb).float().detach().cpu().numpy())
+    test_pred_sum += np.concatenate(fold_preds) / TARGET_SCALE
+test_pred = test_pred_sum / len(modellist)
+
+test = data[data.trade_date > SPLIT_DATE].copy()
+pred_df = pd.DataFrame(test_meta, columns=['ts_code', 'trade_date'])
+pred_df['pred'] = test_pred
+test = test.merge(pred_df, on=['ts_code', 'trade_date'], how='left')
+# 统一裁掉“未来收益无法观测”的最后 5 个交易日（横截面整体剔除，非逐股围栏，避免前视偏差）
+_tail_dates = set(sorted(test['trade_date'].unique())[-5:])
+test = test[~test['trade_date'].isin(_tail_dates)].copy()
+date_calc = sorted(test.trade_date.unique())
+print(f'total elapsed so far: {time.time() - t_start:.1f}s')
+
+
+# =====================================================================
+# 分组法测有效性
+# =====================================================================
+test['industry'] = '通信'
+
+test['factor_rank'] = test.groupby(['trade_date']).pred.rank(pct=True, method='dense')
+
+
+def fun(x):
+    if np.isnan(x):
+        return np.nan
+    else:
+        return min(10, int(x * 10) + 1)
+
+
+test['factor_rank_bin'] = test.factor_rank.apply(fun)
+
+print(test.factor_rank_bin.value_counts())
+
+# 测试集逐日截面 Rank IC：预测 pred 与真实 5 日收益 ret 的 Spearman 相关
+test_ic = (test.dropna(subset=['pred', 'ret'])
+           .groupby('trade_date')[['pred', 'ret']]
+           .apply(lambda g: g['pred'].corr(g['ret'], method='spearman') if len(g) > 1 else np.nan)
+           .dropna())
+if len(test_ic):
+    print(f'[test] RankIC mean={test_ic.mean():.4f} std={test_ic.std():.4f} '
+          f'ICIR={test_ic.mean() / test_ic.std():.4f} days={len(test_ic)}')
+
+test_ic_metrics = {
+    'Test_RankIC_mean': float(test_ic.mean()) if len(test_ic) else np.nan,
+    'Test_RankIC_std': float(test_ic.std()) if len(test_ic) else np.nan,
+    'Test_ICIR': float(test_ic.mean() / test_ic.std()) if len(test_ic) and test_ic.std() > 0 else np.nan,
+    'Test_days': int(len(test_ic)),
+}
+
+# 分组分层：改用与训练/交易一致的 5 日收益 ret，折算日均（/5）后累加
+((test.groupby(['factor_rank_bin', 'trade_date']).ret.mean() - 1.0)
+ .unstack().T.div(5).cumsum().plot(rot=45, grid=True))
+save_show('group_cumret')
+
+# 计算做多做空收益（做多预测最高组、做空预测最低组），统一用 5 日收益 /5
+long_ret = ((test[test.factor_rank_bin == 10].groupby('trade_date').ret.mean() - 1.0) / 5).cumsum()
+short_ret = ((test[test.factor_rank_bin == 1].groupby('trade_date').ret.mean() - 1.0) / 5).cumsum()
+(long_ret - short_ret).plot(rot=45, grid=True)
+save_show('long_short')
+
+ret_PD = (test.groupby(['factor_rank_bin', 'trade_date']).ret.mean() - 1.00).unstack().T.div(5)
+
+if ret_PD[1].mean() > ret_PD[10].mean():
+    ret_PD['diff'] = ret_PD[1] - ret_PD[10]
+else:
+    ret_PD['diff'] = ret_PD[10] - ret_PD[1]
+
+
+def max_dd_group(returns):
+    """Assumes returns is a pandas Series"""
+    r = returns.cumsum() + 1
+    dd = r.div(r.cummax()).sub(1)
+    mdd = dd.min()
+    end = returns.index[dd.argmin()]
+    start = returns.index[r.loc[:end].argmax()]
+    return mdd, start, end
+
+
+def calc_pfmc_groups(ret_PD):
+    performance = []
+    for i in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 'diff']:
+        returnlist = ret_PD[i]
+        ret_year = (returnlist.mean() - 0) * 252
+        ret_sharpe = (returnlist.mean() - 0) / returnlist.std() * (252 ** 0.5)
+        max_draw, start, end = max_dd_group(returnlist)
+        winratio = (returnlist > 0).sum() / len(returnlist)
+        std = returnlist.std()
+        performance.append([i, ret_year, ret_sharpe, std, winratio, max_draw])
+    performance = pd.DataFrame(performance, columns=['group_name', 'return', 'sharpe',
+                                                     'std', 'winratio', 'mdd'])
+    return performance
+
+
+perf_groups = calc_pfmc_groups(ret_PD)
+print(perf_groups)
+
+# 可成交版分档（剔除开盘封板/买不进的样本，与 TopN 同口径），用于 TopN vs 第10档 的公平对比
+test_tr = test[test['buy_tradable'].eq(True)]
+ret_PD_tr = (test_tr.groupby(['factor_rank_bin', 'trade_date']).ret.mean() - 1.0).unstack().T.div(5)
+ret_PD_tr['diff'] = ((ret_PD_tr[10] - ret_PD_tr[1]) if ret_PD_tr[10].mean() >= ret_PD_tr[1].mean()
+                     else (ret_PD_tr[1] - ret_PD_tr[10]))
+perf_groups_tr = calc_pfmc_groups(ret_PD_tr)
+print('[可成交版分组绩效]')
+print(perf_groups_tr)
+
+
+# =====================================================================
+# 固定买入N支
+# =====================================================================
+# 考虑 t+1开盘买 t+5收盘卖的收益情况
+tmp = test.copy()
+# 只保留买入日开盘未封板、可成交的样本
+tmp = tmp[tmp['buy_tradable'].eq(True)]
+num = 20
+tmp = (tmp.sort_values(['trade_date', 'pred'], ascending=[True, False])
+          .groupby('trade_date').head(num).reset_index(drop=True))
+ret_pd1 = pd.DataFrame(tmp.groupby('trade_date').ret.mean() - 1.000) / 5
+(ret_pd1.loc['20250101':, ]).cumsum().plot(rot=45, title='2025 year')
+save_show('topN_cumret')
+
+
+def max_dd(returns):
+    """Assumes returns is a pandas Series"""
+    r = returns.cumsum() + 1
+    dd = r.div(r.cummax()).sub(1)
+    mdd = dd.min().values[0]
+    end = returns.index[dd.values.argmin()]
+    start = returns.index[r.loc[:end].values.argmax()]
+    return mdd, start, end
+
+
+def calc_pfmc(ret_PD):
+    ret_PD_ = ret_PD.copy()
+    performance = []
+    ret_PD_.columns = ['ret']
+    returnlist = ret_PD_['ret']
+    ret_year = (returnlist.mean()) * 252
+    ret_sharpe = (returnlist.mean()) / returnlist.std() * ((252) ** 0.5)
+
+    winratio = (returnlist > 0).sum() / (returnlist != 0).sum()
+    std = returnlist.std()
+
+    ret2_len = pd.DataFrame(tmp.groupby('trade_date').ret.count())
+    ret2_len = ret2_len.reindex(date_calc).fillna(0)
+    stock_pct = ret2_len.mean().values[0]
+    max_draw, start, end = max_dd(ret_PD)
+    performance.append(['Transformer', ret_year, ret_sharpe, std, winratio, max_draw])
+    performance = pd.DataFrame(performance, columns=['group_name', 'return', 'sharpe',
+                                                     'std', 'winratio', 'mdd'])
+    return performance
+
+
+perf_topn = calc_pfmc(ret_pd1)
+print(perf_topn)
+print(ret_pd1.tail(10))
+print(tmp[tmp.trade_date == '20260417'][['ts_code', 'name', 'trade_date', 'pred', 'ret', 'ret1', 'ret5']].head(10))
+
+
+# =====================================================================
+# 对冲收益
+# =====================================================================
+# 基准改为板块内全部股票的等权平均收益（与策略相同的 t+1 开盘买、t+5 收盘卖，折算为日均），不再依赖 tushare 指数数据
+dfindex = pd.DataFrame(test.groupby('trade_date').ret.mean() - 1.000) / 5
+dfindex.columns = ['pct_chg']
+dfindex = dfindex.sort_index()
+print(dfindex)
+
+ret_pd_concat = pd.merge(ret_pd1, dfindex, left_index=True, right_index=True)
+ret_pd_concat.columns = ['ret', 'dfindex']
+ret_pd_concat['diff'] = ret_pd_concat['ret'] - ret_pd_concat['dfindex']
+print(ret_pd_concat)
+
+corr_mat = ret_pd_concat.corr()
+print(corr_mat)
+
+(ret_pd_concat[['ret', 'dfindex']].cumsum()).plot(rot=45, title='2025-2026 year')
+save_show('hedge_cumret')
+
+perf_hedge = calc_pfmc(ret_pd_concat[['diff']])
+print(perf_hedge)
+
+
+# =====================================================================
+# 非重叠 5 日调仓真实绩效（5 相位平均，挤掉重叠收益导致的 Sharpe 虚高）
+# =====================================================================
+NON_OVERLAP_STEP = 5
+
+
+def calc_non_overlapping_pfmc(daily_5d_ret, period=NON_OVERLAP_STEP):
+    """对“重叠的 5 日绝对收益”序列做非重叠采样评估。
+    输入：原始 5 日绝对收益（ret-1，未 /5）。
+    内部构造 period 条互不重叠的相位路径（offset::period）并取平均：
+    年化系数 252/period；有效独立样本≈总交易日/period，Sharpe 置信区间较宽，别过度解读。
+    """
+    r0 = pd.Series(daily_5d_ret).dropna().sort_index()   # 先去掉缺失再按交易日位置切，避免 NaN 造成相位错位
+    acc = {'return': [], 'sharpe': [], 'std': [], 'winratio': [], 'mdd': [], 'n_periods': []}
+    ann = 252.0 / period
+    for offset in range(period):
+        sampled = r0.iloc[offset::period]
+        if len(sampled) < 2:
+            continue
+        nav = (1.0 + sampled).cumprod()                  # 复利净值，最大回撤更准
+        dd = nav / nav.cummax() - 1.0
+        sd = sampled.std()
+        acc['return'].append(float(sampled.mean() * ann))
+        acc['sharpe'].append(float(sampled.mean() / sd * (ann ** 0.5)) if sd > 0 else np.nan)
+        acc['std'].append(float(sd))
+        acc['winratio'].append(float((sampled > 0).mean()))
+        acc['mdd'].append(float(dd.min()))
+        acc['n_periods'].append(int(len(sampled)))
+    return {k: (float(np.nanmean(v)) if np.any(np.isfinite(np.asarray(v, dtype=float))) else np.nan)
+            for k, v in acc.items()}
+
+
+_test_tr = test[test['buy_tradable'].eq(True)]
+
+
+def _daily_topn_ret(df, n=20):
+    """每个交易日取 pred 最高的 n 只（可成交），返回当日平均 5 日绝对收益（ret-1）。"""
+    g = df.dropna(subset=['pred', 'ret'])
+    top = (g.sort_values(['trade_date', 'pred'], ascending=[True, False])
+             .groupby('trade_date').head(n))
+    return top.groupby('trade_date')['ret'].mean() - 1.0
+
+
+def _daily_topdec_ret(df):
+    """每个交易日取 pred 最高 10% 档，返回当日平均 5 日绝对收益（ret-1）。"""
+    g = df.dropna(subset=['pred', 'ret']).copy()
+    g['rk'] = g.groupby('trade_date')['pred'].rank(pct=True, method='dense')
+    return g[g['rk'] > 0.9].groupby('trade_date')['ret'].mean() - 1.0
+
+
+topn_daily = _daily_topn_ret(_test_tr)
+dec_daily = _daily_topdec_ret(_test_tr)
+bench_all_daily = test.dropna(subset=['ret']).groupby('trade_date')['ret'].mean() - 1.0
+bench_tr_daily = _test_tr.dropna(subset=['ret']).groupby('trade_date')['ret'].mean() - 1.0
+
+# 对齐到共同交易日再相减，避免个别日期缺样本导致 NaN 漏算
+_idx = topn_daily.index.intersection(bench_all_daily.index)
+nonoverlap_returns = pd.DataFrame({
+    'TopN': topn_daily,
+    'decile10': dec_daily,
+    'bench_all': bench_all_daily,
+    'bench_tradable': bench_tr_daily,
+}).reindex(_idx)
+nonoverlap_returns['excess_all'] = nonoverlap_returns['TopN'] - nonoverlap_returns['bench_all']
+nonoverlap_returns['excess_tradable'] = nonoverlap_returns['TopN'] - nonoverlap_returns['bench_tradable']
+
+series_map = {
+    'TopN(可成交)': nonoverlap_returns['TopN'],
+    '第10档(可成交)': nonoverlap_returns['decile10'],
+    '基准(全市场等权)': nonoverlap_returns['bench_all'],
+    '基准(可成交等权)': nonoverlap_returns['bench_tradable'],
+    '超额(TopN-全市场)': nonoverlap_returns['excess_all'],
+    '超额(TopN-可成交)': nonoverlap_returns['excess_tradable'],
+}
+perf_nonoverlap = pd.DataFrame(
+    {name: calc_non_overlapping_pfmc(s) for name, s in series_map.items()}
+).T
+print(f'[非重叠 {NON_OVERLAP_STEP} 日调仓 · 5 相位平均 | 有效样本≈{len(_idx) // NON_OVERLAP_STEP} 期]')
+print(perf_nonoverlap)
+
+# 非重叠净值图（取相位 0 的路径示意，非重叠口径）
+_s0_topn = nonoverlap_returns['TopN'].dropna().sort_index().iloc[0::NON_OVERLAP_STEP]
+_s0_bench = nonoverlap_returns['bench_all'].dropna().sort_index().iloc[0::NON_OVERLAP_STEP]
+_nav0 = pd.DataFrame({'TopN': (1 + _s0_topn).cumprod(),
+                      'bench_all': (1 + _s0_bench).cumprod()})
+_nav0.plot(rot=45, title='non-overlap cumulative NAV (phase 0)', grid=True)
+save_show('nonoverlap_nav')
+
+
+# =====================================================================
+# 结果导出到 Excel（多 sheet），保存到脚本所在目录
+# =====================================================================
+perf_cols = ['group_name', 'return', 'sharpe', 'std', 'winratio', 'mdd']
+metrics_all = {'SplitDate': SPLIT_DATE, 'SeqLen': SEQ_LEN, 'BatchSize': BATCH_SIZE,
+               'Epochs': EPOCHS, 'Folds': len(folds), 'PurgeGapDays': PURGE_GAP_DAYS,
+               'WinsorLow': float(ret_lo), 'WinsorHigh': float(ret_hi),
+               'MinValidRatio': MIN_VALID_RATIO,
+               'TrainSamples': len(train_samples), 'TestSamples': len(test_samples),
+               **oof_metrics, **test_ic_metrics}
+metrics_df = pd.DataFrame(list(metrics_all.items()), columns=['指标', '值'])
+
+try:
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results.xlsx')
+except NameError:
+    out_path = os.path.join(os.getcwd(), 'results.xlsx')
+
+with pd.ExcelWriter(out_path, engine='openpyxl') as xw:
+    metrics_df.to_excel(xw, sheet_name='指标汇总', index=False)
+    perf_groups.to_excel(xw, sheet_name='分组绩效', index=False)
+    perf_groups_tr.to_excel(xw, sheet_name='分组绩效(可成交)', index=False)
+    perf_topn.to_excel(xw, sheet_name='TopN绩效', index=False)
+    perf_hedge.to_excel(xw, sheet_name='对冲绩效', index=False)
+    corr_mat.to_excel(xw, sheet_name='对冲相关性')
+    ret_pd1.tail(10).to_excel(xw, sheet_name='TopN日收益尾10')
+    ret_pd_concat.to_excel(xw, sheet_name='对冲逐日收益')
+    perf_nonoverlap.to_excel(xw, sheet_name='非重叠5日绩效')
+    nonoverlap_returns.to_excel(xw, sheet_name='非重叠逐期收益')
+    pd.DataFrame({'feature': features}).to_excel(xw, sheet_name='因子列表', index=False)
+    if factor_screen_report is not None:
+        factor_screen_report.to_excel(xw, sheet_name='因子质量筛选', index=False)
+print('结果已导出:', out_path)
+
+print(f'total elapsed: {time.time() - t_start:.1f}s')
